@@ -8,7 +8,7 @@ import torch.optim as optim
 import numpy as np
 from sklearn.metrics import roc_curve, auc
 from sklearn.model_selection import KFold
-import os,time,torch, warnings
+import os,time,torch, warnings,math
 from my_Utils import Thresholds,OUT_nodes,calculate_performance,cacul_aupr,CFG
 from prettytable import PrettyTable
 from torchinfo import summary
@@ -190,27 +190,39 @@ class Weight_classifier(nn.Module):
 
 
 class Seq_Module(nn.Module):
-    def __init__(self, func):
+    def __init__(self, func,em_dim, b=1, gamma=2):
         super(Seq_Module, self).__init__()
         self.EmSeq = nn.Embedding(num_embeddings=25, embedding_dim=128, padding_idx=0).cuda()
-        self.Norm = nn.BatchNorm1d(128)
-        self.eca = ECA(128,1502).cuda()
+        kernel_size = int(abs((math.log)(em_dim, 2) + b) / gamma)
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        self.GAP = nn.AdaptiveAvgPool1d(1)
+        self.GMP = nn.AdaptiveMaxPool1d(1)
+        self.Conv1D = nn.Conv1d(2, 1, kernel_size=kernel_size,
+                                padding=(kernel_size - 1) // 2)
+        self.Sigmoid = nn.Sigmoid()
+        self.OUT = nn.Dropout(0.3)
         self.seq_CNN = self.SeqConv1d(CFG['cfg05']).cuda()
         self.seq_FClayer = nn.Linear(3008, 1024).cuda()
         self.seq_outlayer = nn.Linear(1024, OUT_nodes[func]).cuda()
 
     def forward(self, seqMatrix):
-        seqMatrix = self.EmSeq(seqMatrix)
+        seqMatrix= self.EmSeq(seqMatrix) 
         seqMatrix = seqMatrix.permute(0, 2, 1) 
-        seqMatrix = self.Norm(seqMatrix)
-        seq_out = self.eca(seqMatrix)
-        seq_out = self.seq_CNN(seq_out)
+        input = x
+        avg_out = self.GAP(x)
+        max_out = self.GMP(x)
+        x = torch.cat((avg_out, max_out), 2)
+        x = self.Conv1D(x.permute(0, 2, 1)).permute(0, 2, 1)
+        x = self.Sigmoid(x)
+        x = self.OUT(input * x)
+        seq_out = self.seq_CNN(seqMatrix)
         seq_out = seq_out.view(seq_out.size(0), -1)
         seq_out = F.dropout(self.seq_FClayer(seq_out), p=0.5, training=self.training)
         seq_out = F.relu(seq_out)
         seq_out = self.seq_outlayer(seq_out)
         seq_out = F.sigmoid(seq_out)
         return seq_out
+        
 
     def SeqConv1d(self, cfg):
         layers = []
@@ -227,19 +239,64 @@ class Seq_Module(nn.Module):
                            nn.ReLU(inplace=True)]
                 in_channels = x
         return nn.Sequential(*layers)
+    
 
 class Domain_Module(nn.Module):
-    def __init__(self, func):
+    def __init__(self, func, features=357,em_dim=128,Lkernel = 16, Skernel=8, reduction_ratio = 16):
         super(Domain_Module, self).__init__()
+        self.LargeKernel = Lkernel
+        self.SmallKernel = Skernel
         self.Dom_EmLayer = nn.Embedding(14243, 128, padding_idx=0).cuda()   
-        self.SK = SelectiveKernelAttention(357,128)
+        self.LargeConv = nn.Sequential(
+            nn.Conv1d(features, features, kernel_size=self.LargeKernel,
+                      padding=(self.LargeKernel-1) // 2),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm([features, em_dim-1])
+        )
+        self.SmallConv = nn.Sequential(
+            nn.Conv1d(features, features, kernel_size=self.SmallKernel,
+                      padding=(self.SmallKernel-1) // 2),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm([features,em_dim-1])
+        )
+        self.FC = nn.Sequential(
+            nn.Linear(features, features // reduction_ratio),
+            nn.ReLU(inplace=True),
+            nn.Linear(features // reduction_ratio, features),
+            nn.LayerNorm([features])
+        )
+        self.GAP = nn.AdaptiveAvgPool1d(1)
+        self.GMP = nn.AdaptiveMaxPool1d(1)
+        self.FC = nn.Sequential(
+            nn.Linear(em_dim, em_dim // reduction_ratio),
+            nn.ReLU(inplace=True),
+            nn.Linear(em_dim // reduction_ratio, em_dim),
+            nn.LayerNorm([em_dim])
+        )
+        self.Sigmoid = nn.Sigmoid()
+        self.OUT = nn.Dropout(0.6)
         self.Dom_CNN = self.DomainConv1d(CFG['cfg07']).cuda()
         self.Dom_FClayer = nn.Linear(1088, 512).cuda()
         self.Dom_Outlayer = nn.Linear(512, OUT_nodes[func]).cuda()
 
     def forward(self, domainSentence): 
-        domain_matrix = self.Dom_EmLayer(domainSentence)    
-        domain_out = self.SK(domain_matrix)
+        x = self.Dom_EmLayer(domainSentence)    
+        x = self.Norm(x)
+        Lx = self.LargeConv(x)
+        Sx = self.SmallConv(x)
+        x_unite = Lx + Sx
+        avg_out = self.GAP(x_unite).squeeze(-1)
+        max_out = self.GMP(x_unite).squeeze(-1)
+        avg_out = self.FC(avg_out)
+        max_out = self.FC(max_out)
+        score = avg_out + max_out
+        score = score.view(score.size(0), -1, 1)
+        Largescore = self.Sigmoid(score)
+        Smallscore = 1 - Largescore
+        Lout = Lx * Largescore
+        Sout = Sx * Smallscore
+        domain_out = self.OUT(Lout + Sout)
+        domain_out = self.Sk(domain_out)
         domain_out = self.Dom_CNN(domain_out)
         domain_out = domain_out.view(domain_out.size(0), -1)  
         domain_out = F.dropout(self.Dom_FClayer(domain_out), p=0.3, training=self.training)
@@ -247,8 +304,11 @@ class Domain_Module(nn.Module):
         domain_out = self.Dom_Outlayer(domain_out)
         domain_out = F.sigmoid(domain_out)
         return domain_out
+
+        
     def DomainConv1d(self, cfg):
         layers = []
+        
         in_channels = 357
         for x in cfg:
             if x == 'M':
@@ -264,8 +324,8 @@ class Domain_Module(nn.Module):
 class PPI_Module(nn.Module):
     def __init__(self, func):
         super(PPI_Module, self).__init__()
-        self.ppi_conv1d = nn.Conv1d(1, 8, kernel_size=4).cuda()
-        self.ppi_hiddenlayer = nn.Linear(8168, 2048).cuda()
+        self.ppi_conv1d = nn.Conv1d(1, 2, kernel_size=4).cuda()
+        self.ppi_hiddenlayer = nn.Linear(32762, 2048).cuda()
         self.ppi_outlayer = nn.Linear(2048, OUT_nodes[func]).cuda()
 
     def forward(self, ppiVec):
@@ -505,7 +565,7 @@ if __name__ == '__main__':
     table3.add_row([Terms[0], format(f_mean, '.3f'), format(rec_mean, '.3f'), format(pre_mean, '.3f'),
                    format(auc_mean, '.3f'), format(aupr_mean, '.3f'), alltime])
     print(table3)
-    print('运行结束')
+    print('Run Over')
     print('*' * 50)
     print(table1)
     print(table2)
